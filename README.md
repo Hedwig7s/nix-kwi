@@ -11,7 +11,7 @@ workflow refreshes the pin after the build passes.
 Requires Nix with flakes enabled on `x86_64-linux`.
 
 ```sh
-nix build github:wito-dev/nix-kwi
+nix build github:Hedwig7s/nix-kwi
 ```
 
 The build produces `result/bin/kwi`. Run it from a graphical KDE or Qt session.
@@ -35,44 +35,6 @@ Or use the overlay, which adds `pkgs.kwi` and `pkgs.libghostty-vt`:
 ```nix
 nixpkgs.overlays = [ inputs.kwi.overlays.default ];
 ```
-
-## Use the FlakeHub Cache
-
-Scheduled builds and main-branch releases populate
-[FlakeHub Cache](https://flakehub.com/cache). Nix selects cache entries by
-store path, so the input can stay on GitHub.
-
-FlakeHub Cache is a paid FlakeHub feature, and cache reads require
-authentication. Without it, the workflows fall back to the GitHub Actions
-cache, which only serves those workflow runs.
-
-1. Install [Determinate Nix](https://docs.determinate.systems/getting-started/individuals/)
-   and log in:
-
-   ```sh
-   determinate-nixd login
-   ```
-
-2. Keep the input pointing at this repository:
-
-   ```nix
-   inputs.kwi.url = "github:wito-dev/nix-kwi";
-   ```
-
-3. Use the flake's locked inputs. A cache hit requires the same store paths:
-
-   ```nix
-   # Do not add this if you want cache hits: it replaces the locked nixpkgs.
-   # inputs.kwi.inputs.nixpkgs.follows = "nixpkgs";
-   ```
-
-   If your `flake.lock` resolves `nixpkgs` or `kwi-src` to a different
-   revision than this flake's lock, the store paths differ and the cache
-   misses. The cache only contains revisions that CI built.
-
-On GitHub Actions, Determinate Nix authenticates with FlakeHub automatically.
-Add `id-token: write` to the job and use the
-[`flakehub-cache-action`](https://github.com/DeterminateSystems/flakehub-cache-action).
 
 ## libghostty-vt
 
