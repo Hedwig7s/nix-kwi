@@ -20,7 +20,7 @@ The build produces `result/bin/kwi`. Run it from a graphical KDE or Qt session.
 
 ```nix
 {
-  inputs.kwi.url = "github:wito-dev/nix-kwi";
+  inputs.kwi.url = "github:Hedwig7s/nix-kwi";
 }
 ```
 
