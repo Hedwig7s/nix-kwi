@@ -1,61 +1,223 @@
-name: Update from upstream master
+name: Build and publish Kwi release
 
 on:
   schedule:
-    # Kwi is pre-release, so follow master once a day.
     - cron: "23 3 * * *"
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 permissions:
   contents: write
-  id-token: write
 
 concurrency:
-  group: update
+  group: publish-kwi-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  update:
+  release:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - uses: DeterminateSystems/determinate-nix-action@v3
-
-      - uses: DeterminateSystems/flakehub-cache-action@v3
-        with:
-          flakehub-flake-name: wito/nix-kwi
 
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
           df -h /
 
-      - name: Bump the Kwi pin
-        run: nix flake update kwi-src
+      - name: Update the upstream Kwi source pin
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: nix flake update kwi-src --accept-flake-config
 
-      - name: Build
-        run: nix build .#kwi --print-build-logs --no-link
-
-      - name: Push the new lock file
+      - name: Commit the updated source pin
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if git diff --quiet -- flake.lock; then
-            echo "Upstream master is unchanged." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+          set -euo pipefail
+          if ! git diff --quiet -- flake.lock; then
+            rev=$(jq -r '.nodes["kwi-src"].locked.rev // "unknown"' flake.lock)
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add flake.lock
+            git commit -m "ci: update Kwi source to ${rev:0:10}"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
 
-          rev=$(jq -r '.nodes["kwi-src"].locked.rev' flake.lock)
-          short=$(printf '%s' "$rev" | cut -c1-10)
-          version=$(nix eval --raw .#kwi.version)
+      - name: Build Kwi and libghostty-vt on the release runner
+        run: |
+          nix build .#kwi .#libghostty-vt \
+            --accept-flake-config \
+            --print-build-logs \
+            --no-link \
+            --option substituters https://cache.nixos.org \
+            --option extra-substituters ""
 
+      - name: Check whether the current binaries are already released
+        id: release-check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          kwi_out=$(nix eval --accept-flake-config --raw .#kwi.outPath)
+          ghostty_out=$(nix eval --accept-flake-config --raw .#libghostty-vt.outPath)
+          version=$(nix eval --accept-flake-config --raw .#kwiVersion)
+          rev=$(jq -r '.nodes["kwi-src"].locked.rev' flake.lock)
+
+          old_kwi=$(jq -r '.kwiStorePath // empty' binary-release.json)
+          old_ghostty=$(jq -r '.libghosttyStorePath // empty' binary-release.json)
+          old_tag=$(jq -r '.tag // empty' binary-release.json)
+          old_format=$(jq -r '.formatVersion // 0' binary-release.json)
+
+          echo "kwi_out=${kwi_out}" >> "$GITHUB_OUTPUT"
+          echo "ghostty_out=${ghostty_out}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "rev=${rev}" >> "$GITHUB_OUTPUT"
+
+          if [[ "$old_kwi" == "$kwi_out" \
+             && "$old_ghostty" == "$ghostty_out" \
+             && "$old_format" == "2" \
+             && -n "$old_tag" ]] \
+             && gh release view "$old_tag" --json assets --jq '.assets[].name' \
+                | grep -Fxq 'kwi-x86_64-linux.tar.gz'; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "The current Kwi binaries are already available in release ${old_tag}." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create a conventional Linux binary tarball
+        if: steps.release-check.outputs.publish == 'true'
+        id: bundle
+        env:
+          KWI_OUT: ${{ steps.release-check.outputs.kwi_out }}
+          GHOSTTY_OUT: ${{ steps.release-check.outputs.ghostty_out }}
+        run: |
+          set -euo pipefail
+          # Always use a new, runner-owned directory. A previous run may have
+          # left RUNNER_TEMP paths with restrictive ownership/permissions.
+          work=$(mktemp -d "$RUNNER_TEMP/kwi-release-work.XXXXXX")
+          bundle_root="$work/kwi-release"
+          app_root="$bundle_root/app"
+          runtime_root="$bundle_root/runtime/libghostty-vt"
+          archive="$work/kwi-x86_64-linux.tar.gz"
+          mkdir -p "$app_root" "$runtime_root"
+          test -x "$KWI_OUT/bin/kwi"
+          test -d "$GHOSTTY_OUT/lib"
+          find "$GHOSTTY_OUT/lib" -maxdepth 1 \
+            \( -type f -o -type l \) -name 'libghostty-vt.so*' -print -quit | grep -q .
+
+          # Keep the application tree and its extra runtime library in separate
+          # archive directories. The Kwi output may itself contain a
+          # libghostty-vt symlink into /nix/store; never mkdir through that link.
+          cp -a "$KWI_OUT/." "$app_root/"
+          cp -a "$GHOSTTY_OUT/." "$runtime_root/"
+
+          cat > "$bundle_root/README.txt" <<'EOF2'
+          Kwi Linux x86_64 binary bundle
+
+          This conventional tar.gz contains the installed Kwi application in
+          app/ and the matching libghostty-vt runtime in runtime/. Install it
+          through the nix-kwi flake's kwi-bin package. The flake relocates the
+          bundled application and library into the Nix output and supplies the
+          pinned Qt/KDE runtime dependencies from the standard Nix cache.
+          EOF2
+
+          # Stable archive metadata makes the uploaded artifact reproducible
+          # for an identical pair of Nix store outputs.
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -C "$work" -cf - kwi-release | gzip -n > "$archive"
+
+          archive_hash=$(nix hash file --type sha256 --sri "$archive")
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${archive_hash}" >> "$GITHUB_OUTPUT"
+          echo "size=$(du -h "$archive" | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the GitHub Release tarball
+        if: steps.release-check.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE: ${{ steps.bundle.outputs.archive }}
+          ARCHIVE_SIZE: ${{ steps.bundle.outputs.size }}
+          KWI_OUT: ${{ steps.release-check.outputs.kwi_out }}
+          GHOSTTY_OUT: ${{ steps.release-check.outputs.ghostty_out }}
+          VERSION: ${{ steps.release-check.outputs.version }}
+          UPSTREAM_REV: ${{ steps.release-check.outputs.rev }}
+          ARCHIVE_HASH: ${{ steps.bundle.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          short_rev="${UPSTREAM_REV:0:12}"
+          kwi_store_hash=$(basename "$KWI_OUT" | cut -c1-10)
+          release_tag="kwi-${short_rev}-${kwi_store_hash}"
+
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF2
+          Prebuilt Kwi Linux x86_64 application bundle.
+
+          - Upstream Kwi revision: ${UPSTREAM_REV}
+          - Kwi version: ${VERSION}
+          - Kwi Nix build output: ${KWI_OUT}
+          - libghostty-vt Nix build output: ${GHOSTTY_OUT}
+          - Archive: kwi-x86_64-linux.tar.gz (${ARCHIVE_SIZE})
+          - SHA-256 (SRI): ${ARCHIVE_HASH}
+
+          This is a conventional gzip-compressed tar archive containing the
+          installed Kwi application tree and bundled libghostty-vt library.
+          It is not a Nix binary cache and contains no .nar or .narinfo files.
+          Install it using `.#kwi-bin` from the nix-kwi flake; the flake fetches
+          this archive and supplies the pinned Qt/KDE runtime dependencies.
+          EOF2
+
+          if gh release view "$release_tag" >/dev/null 2>&1; then
+            gh release upload "$release_tag" "$ARCHIVE" --clobber
+            gh release edit "$release_tag" \
+              --title "Kwi ${VERSION} Linux x86_64" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          else
+            gh release create "$release_tag" "$ARCHIVE" \
+              --title "Kwi ${VERSION} Linux x86_64" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --target "$(git rev-parse HEAD)"
+          fi
+
+          jq -n \
+            --arg tag "$release_tag" \
+            --arg version "$VERSION" \
+            --arg upstreamRev "$UPSTREAM_REV" \
+            --arg archiveName "kwi-x86_64-linux.tar.gz" \
+            --arg sha256 "$ARCHIVE_HASH" \
+            --arg kwiStorePath "$KWI_OUT" \
+            --arg libghosttyStorePath "$GHOSTTY_OUT" \
+            '{formatVersion: 2, tag: $tag, version: $version, upstreamRev: $upstreamRev, archiveName: $archiveName, sha256: $sha256, kwiStorePath: $kwiStorePath, libghosttyStorePath: $libghosttyStorePath}' \
+            > binary-release.json
+
+      - name: Verify the binary package without compiling Kwi
+        run: |
+          set -euo pipefail
+          nix build .#kwi-bin \
+            --accept-flake-config \
+            --print-build-logs \
+            --no-link \
+            --option substituters https://cache.nixos.org \
+            --option extra-substituters ""
+          echo "The prebuilt Kwi tarball installs successfully." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit the release metadata
+        if: steps.release-check.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add flake.lock
-          git commit -m "kwi: update upstream master to ${short} (${version})"
-          git push
+          git add binary-release.json
+          git commit -m "ci: publish Kwi binary release metadata"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
 
-          {
-            echo "Updated Kwi to \`${rev}\`."
-            echo
-            echo "https://invent.kde.org/utilities/kwi/-/commits/master"
-          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Report that no new release was needed
+        if: steps.release-check.outputs.publish == 'false'
+        run: echo "The current prebuilt Kwi binaries are already released." >> "$GITHUB_STEP_SUMMARY"
