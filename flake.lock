@@ -1,5 +1,17 @@
 {
   "nodes": {
+    "kwi-cache-archive": {
+      "flake": false,
+      "locked": {
+        "path": "./no-cache",
+        "type": "path"
+      },
+      "original": {
+        "path": "./no-cache",
+        "type": "path"
+      },
+      "parent": []
+    },
     "kwi-src": {
       "flake": false,
       "locked": {
@@ -34,6 +46,7 @@
     },
     "root": {
       "inputs": {
+        "kwi-cache-archive": "kwi-cache-archive",
         "kwi-src": "kwi-src",
         "nixpkgs": "nixpkgs"
       }
