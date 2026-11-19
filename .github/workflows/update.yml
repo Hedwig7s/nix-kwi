@@ -1,61 +1,393 @@
-name: Update from upstream master
+name: Build and publish Kwi GitHub Release
 
 on:
+  # Follow upstream master daily because Kwi is not tagged yet.
   schedule:
-    # Kwi is pre-release, so follow master once a day.
     - cron: "23 3 * * *"
   workflow_dispatch:
+  # Publish a fresh cache when packaging or flake inputs change.
+  push:
+    branches:
+      - main
 
 permissions:
   contents: write
-  id-token: write
 
 concurrency:
-  group: update
+  group: publish-kwi-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  update:
+  release:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - uses: DeterminateSystems/determinate-nix-action@v3
-
-      - uses: DeterminateSystems/flakehub-cache-action@v3
-        with:
-          flakehub-flake-name: wito/nix-kwi
 
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
           df -h /
 
-      - name: Bump the Kwi pin
-        run: nix flake update kwi-src
-
-      - name: Build
-        run: nix build .#kwi --print-build-logs --no-link
-
-      - name: Push the new lock file
+      # Migrate away from the old `binary-cache` input name. Earlier versions
+      # accidentally encoded it as a registry alias (flake:binary-cache). The
+      # archive now has a distinct, explicit input name and URL.
+      - name: Normalize legacy binary cache flake references
         run: |
-          if git diff --quiet -- flake.lock; then
-            echo "Upstream master is unchanged." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          import json
+          import re
+          from pathlib import Path
+
+          metadata = json.loads(Path("binary-cache.json").read_text())
+          tag = metadata.get("tag")
+          flake_path = Path("flake.nix")
+          source = flake_path.read_text()
+
+          # Remove all old input forms, including a nested attrset such as:
+          # inputs.binary-cache = { url = "binary-cache"; flake = false; };
+          # and inputs = { binary-cache.url = "binary-cache"; }.
+          old_block = re.compile(
+              r"(?ms)^[ \t]*(?:inputs\.)?binary-cache[ \t]*=[ \t]*\{.*?^[ \t]*\};[ \t]*\n"
+          )
+          source = old_block.sub("", source)
+          old_string_assignment = re.compile(
+              r'(?m)^[ \t]*(?:inputs\.)?binary-cache(?:\.url)?[ \t]*=[ \t]*"[^"\n]*"[ \t]*;[ \t]*\n'
+          )
+          source = old_string_assignment.sub("", source)
+
+          if tag:
+              block = (
+                  "  # BEGIN GENERATED BINARY CACHE INPUT\n"
+                  "  inputs.kwi-cache-archive = {\n"
+                  f'    url = "tarball+https://github.com/Hedwig7s/nix-kwi/releases/download/{tag}/nix-kwi-binary-cache.tar.gz";\n'
+                  "    flake = false;\n"
+                  "  };\n"
+                  "  # END GENERATED BINARY CACHE INPUT"
+              )
+          else:
+              # Always declare the input: an undeclared outputs argument makes
+              # Nix invent flake:kwi-cache-archive and fail registry lookup.
+              block = (
+                  "  # BEGIN GENERATED BINARY CACHE INPUT\n"
+                  "  inputs.kwi-cache-archive = {\n"
+                  '    url = "path:./no-cache";\n'
+                  "    flake = false;\n"
+                  "  };\n"
+                  "  # END GENERATED BINARY CACHE INPUT"
+              )
+
+          marker = re.compile(
+              r"(?ms)^  # BEGIN GENERATED BINARY CACHE INPUT\n.*?^  # END GENERATED BINARY CACHE INPUT$"
+          )
+          source, count = marker.subn(lambda _: block, source)
+          if count != 1:
+              raise SystemExit(f"expected one generated cache-input marker, found {count}")
+
+          # Assert no legacy input declarations survived normalization.
+          if re.search(r"(?m)^[ \t]*(?:inputs\.)?binary-cache(?:\.url)?[ \t]*=", source):
+              raise SystemExit("legacy binary-cache input declaration remains in flake.nix")
+          flake_path.write_text(source)
+
+          # Remove old lock-file aliases unconditionally. Also force the new
+          # archive input to be re-resolved against the explicit tarball URL.
+          lock_path = Path("flake.lock")
+          lock = json.loads(lock_path.read_text())
+          nodes = lock.setdefault("nodes", {})
+          root_inputs = nodes.setdefault("root", {}).setdefault("inputs", {})
+          removed = []
+          for input_name in ("binary-cache", "kwi-cache-archive"):
+              node_id = root_inputs.pop(input_name, None)
+              if isinstance(node_id, str):
+                  removed.append(node_id)
+
+          # Delete removed nodes only when no other lock node still refers to them.
+          def referenced(node_id):
+              for node in nodes.values():
+                  inputs = node.get("inputs", {}) if isinstance(node, dict) else {}
+                  if isinstance(inputs, dict):
+                      for value in inputs.values():
+                          if value == node_id:
+                              return True
+                          if isinstance(value, list) and node_id in value:
+                              return True
+              return False
+
+          for node_id in set(removed):
+              if node_id in nodes and not referenced(node_id):
+                  nodes.pop(node_id, None)
+
+          # Remove an unreferenced legacy node named exactly `binary-cache` too.
+          if "binary-cache" in nodes and not referenced("binary-cache"):
+              nodes.pop("binary-cache", None)
+
+          lock_path.write_text(json.dumps(lock, indent=2) + "\n")
+          PYCODE
+
+          # Resolve only the explicitly named tarball input, never a registry
+          # alias. This runs before the source update and before any build.
+          nix flake lock --accept-flake-config
+
+          # Make the failure actionable if any old indirect ref remains in the lock.
+          if jq -e '.nodes.root.inputs["binary-cache"]' flake.lock >/dev/null 2>&1; then
+            echo "Legacy binary-cache root input remains in flake.lock" >&2
+            exit 1
           fi
 
+      - name: Bump the Kwi source pin
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: nix flake update kwi-src --accept-flake-config
+
+      - name: Push normalized flake inputs and updated lock file
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet -- flake.nix flake.lock; then
+            echo "Flake inputs and lock file are already normalized."
+          else
+            rev=$(jq -r '.nodes["kwi-src"].locked.rev // "unknown"' flake.lock)
+            short=$(printf '%s' "$rev" | cut -c1-10)
+
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add flake.nix flake.lock
+            git commit -m "ci: normalize flake inputs (${short})"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Build Kwi from source
+        run: |
+          nix build .#kwi --accept-flake-config --print-build-logs --no-link \
+            --option substituters https://cache.nixos.org \
+            --option extra-substituters ""
+
+      - name: Check whether this output already has a release
+        id: cache
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          out_path=$(nix eval --accept-flake-config --raw .#kwi.outPath)
+          old_path=$(jq -r '.storePath // empty' binary-cache.json)
+          old_tag=$(jq -r '.tag // empty' binary-cache.json)
+          old_hash=$(jq -r '.archiveHash // empty' binary-cache.json)
+          old_cache_path=$(jq -r '.cacheStorePath // empty' binary-cache.json)
+
+          echo "store_path=${out_path}" >> "$GITHUB_OUTPUT"
+          if [[ "$out_path" == "$old_path" && -n "$old_tag" && -n "$old_hash" && -n "$old_cache_path" ]] \
+            && gh release view "$old_tag" --json assets --jq '.assets[].name' \
+              | grep -Fxq 'nix-kwi-binary-cache.tar.gz'; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "The current Kwi output is already available in GitHub Release ${old_tag}." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate a signing key and create one cache archive
+        if: steps.cache.outputs.publish == 'true'
+        id: export
+        env:
+          STORE_PATH: ${{ steps.cache.outputs.store_path }}
+        run: |
+          set -euo pipefail
+
+          work_dir="$RUNNER_TEMP/nix-kwi-cache-work"
+          cache_dir="$work_dir/cache"
+          archive_root="$work_dir/archive-root"
+          upload_dir="$RUNNER_TEMP/nix-kwi-release-assets"
+          release_cache="$archive_root/nix-kwi-cache"
+          mkdir -p "$cache_dir" "$release_cache/nar" "$upload_dir"
+
+          key_name="nix-kwi-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          nix-store --generate-binary-cache-key "$key_name" \
+            "$work_dir/secret-key" "$work_dir/public-key"
+
+          # Sign the complete runtime closure, including libghostty-vt.
+          nix store sign --recursive --key-file "$work_dir/secret-key" "$STORE_PATH"
+          nix copy --to "file://$cache_dir" "$STORE_PATH"
+
+          # Preserve the standard cache layout. The archive contains only
+          # public cache data; the generated secret signing key is never copied.
+          sed -i 's/^WantMassQuery:.*/WantMassQuery: 0/' "$cache_dir/nix-cache-info"
+          cp "$cache_dir/nix-cache-info" "$release_cache/"
+          cp "$cache_dir"/*.narinfo "$release_cache/"
+          cp "$cache_dir"/nar/* "$release_cache/nar/"
+
+          archive="$upload_dir/nix-kwi-binary-cache.tar.gz"
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -czf "$archive" -C "$archive_root" nix-kwi-cache
+
+          # Hash the extracted directory, which is what Nix's tarball flake
+          # fetcher stores after stripping the single top-level folder.
+          archive_hash=$(nix hash path --type sha256 --sri "$release_cache")
+          public_key=$(cat "$work_dir/public-key")
+          release_tag="kwi-cache-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "public_key=${public_key}" >> "$GITHUB_OUTPUT"
+          echo "archive_hash=${archive_hash}" >> "$GITHUB_OUTPUT"
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+          echo "archive_size=$(du -h "$archive" | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Create the GitHub Release and upload the cache tarball
+        if: steps.cache.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.export.outputs.release_tag }}
+          ARCHIVE: ${{ steps.export.outputs.archive }}
+          ARCHIVE_SIZE: ${{ steps.export.outputs.archive_size }}
+          STORE_PATH: ${{ steps.cache.outputs.store_path }}
+        run: |
+          set -euo pipefail
           rev=$(jq -r '.nodes["kwi-src"].locked.rev' flake.lock)
-          short=$(printf '%s' "$rev" | cut -c1-10)
-          version=$(nix eval --raw .#kwi.version)
+          version=$(nix eval --accept-flake-config --raw .#kwiVersion)
+
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF2
+          Signed Nix binary cache for Kwi.
+
+          Upstream Kwi revision: ${rev}
+          Nix store output: ${STORE_PATH}
+
+          The complete cache is bundled into one archive (${ARCHIVE_SIZE}):
+          nix-kwi-binary-cache.tar.gz
+
+          The flake locks and extracts this archive as a non-flake tarball input,
+          then uses the extracted directory as a local Nix binary substituter.
+          EOF2
+
+          gh release create "$RELEASE_TAG" \
+            --title "Kwi ${version} binary cache" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --target "$(git rev-parse HEAD)"
+
+          # One GitHub Release asset instead of one asset per NAR/narinfo.
+          gh release upload "$RELEASE_TAG" "$ARCHIVE"
+
+      - name: Update the locked cache tarball input and release metadata
+        if: steps.cache.outputs.publish == 'true'
+        env:
+          RELEASE_TAG: ${{ steps.export.outputs.release_tag }}
+          PUBLIC_KEY: ${{ steps.export.outputs.public_key }}
+          STORE_PATH: ${{ steps.cache.outputs.store_path }}
+          ARCHIVE_HASH: ${{ steps.export.outputs.archive_hash }}
+        run: |
+          set -euo pipefail
+
+          # First record release identity and integrity metadata. cacheStorePath
+          # is filled after Nix resolves and extracts the tarball flake input.
+          jq -n \
+            --arg tag "$RELEASE_TAG" \
+            --arg publicKey "$PUBLIC_KEY" \
+            --arg storePath "$STORE_PATH" \
+            --arg archiveHash "$ARCHIVE_HASH" \
+            --arg archiveName "nix-kwi-binary-cache.tar.gz" \
+            '{tag: $tag, publicKey: $publicKey, storePath: $storePath, archiveHash: $archiveHash, archiveName: $archiveName, cacheStorePath: null}' \
+            > binary-cache.json
+
+          export RELEASE_TAG
+          python3 - <<'PYCODE'
+          import os
+          import re
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"]
+          path = Path("flake.nix")
+          source = path.read_text()
+          block = (
+              "  # BEGIN GENERATED BINARY CACHE INPUT\n"
+              "  inputs.kwi-cache-archive = {\n"
+              f'    url = "tarball+https://github.com/Hedwig7s/nix-kwi/releases/download/{tag}/nix-kwi-binary-cache.tar.gz";\n'
+              "    flake = false;\n"
+              "  };\n"
+              "  # END GENERATED BINARY CACHE INPUT"
+          )
+          pattern = re.compile(
+              r"(?ms)^  # BEGIN GENERATED BINARY CACHE INPUT\n.*?^  # END GENERATED BINARY CACHE INPUT$"
+          )
+          updated, count = pattern.subn(lambda _: block, source)
+          if count != 1:
+              raise SystemExit(f"expected one binary-cache input marker, found {count}")
+          path.write_text(updated)
+          PYCODE
+
+          # Nix's flake tarball fetcher downloads and extracts the cache into
+          # the store, with the locked narHash protecting its contents. On the
+          # very first release, the input does not exist in flake.lock yet.
+          if jq -e '.nodes.root.inputs["kwi-cache-archive"]' flake.lock >/dev/null 2>&1; then
+            nix flake update kwi-cache-archive --accept-flake-config
+          else
+            nix flake lock --accept-flake-config
+          fi
+
+          cache_store_path=$(nix eval --accept-flake-config --raw .#binaryCachePath)
+          [[ "$cache_store_path" == /nix/store/* ]]
+          locked_hash=$(jq -r '.nodes[.nodes.root.inputs["kwi-cache-archive"]].locked.narHash' flake.lock)
+          [[ "$locked_hash" == "$ARCHIVE_HASH" ]] || {
+            echo "The locked tarball NAR hash does not match the release archive hash." >&2
+            exit 1
+          }
+
+          jq --arg cacheStorePath "$cache_store_path" \
+            '.cacheStorePath = $cacheStorePath' binary-cache.json > "$RUNNER_TEMP/binary-cache.json"
+          mv "$RUNNER_TEMP/binary-cache.json" binary-cache.json
+
+          # nixConfig must itself remain a literal attribute set. Use the
+          # extracted, lock-pinned cache directory as a local file substituter.
+          export CACHE_STORE_PATH="$cache_store_path"
+          export PUBLIC_KEY
+          python3 - <<'PYCODE'
+          import os
+          import re
+          from pathlib import Path
+
+          cache_store_path = os.environ["CACHE_STORE_PATH"]
+          public_key = os.environ["PUBLIC_KEY"]
+          block = (
+              "  # BEGIN GENERATED BINARY CACHE CONFIG\n"
+              "  nixConfig = {\n"
+              f'    extra-substituters = [ "file://{cache_store_path}" ];\n'
+              f'    extra-trusted-public-keys = [ "{public_key}" ];\n'
+              "  };\n"
+              "  # END GENERATED BINARY CACHE CONFIG"
+          )
+
+          path = Path("flake.nix")
+          source = path.read_text()
+          pattern = re.compile(
+              r"(?ms)^  # BEGIN GENERATED BINARY CACHE CONFIG\n.*?^  # END GENERATED BINARY CACHE CONFIG$"
+          )
+          updated, count = pattern.subn(lambda _: block, source)
+          if count != 1:
+              raise SystemExit(f"expected one generated nixConfig marker, found {count}")
+          path.write_text(updated)
+          PYCODE
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add flake.lock
-          git commit -m "kwi: update upstream master to ${short} (${version})"
-          git push
+          git add flake.nix flake.lock binary-cache.json
+          git commit -m "ci: publish Kwi binary cache metadata"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Verify the extracted cache and build kwi-bin
+        run: |
+          set -euo pipefail
+          jq -e '.tag != null and .publicKey != null and .storePath != null and .archiveHash != null and .cacheStorePath != null' binary-cache.json >/dev/null
+
+          # Nix has already extracted the non-flake tarball input. The flake's
+          # literal nixConfig points to that directory as a local substituter.
+          # This builds only the symlink wrapper, not Kwi or its dependencies.
+          nix build .#kwi-bin --accept-flake-config --print-build-logs --no-link
 
           {
-            echo "Updated Kwi to \`${rev}\`."
+            echo "Published one GitHub Release tarball containing the complete signed binary cache."
             echo
-            echo "https://invent.kde.org/utilities/kwi/-/commits/master"
+            echo "Source builds remain available as .#kwi and .#kwi-source."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report that no new release was needed
+        if: steps.cache.outputs.publish == 'false'
+        run: echo "No new release was needed; the current store output is already published." >> "$GITHUB_STEP_SUMMARY"
