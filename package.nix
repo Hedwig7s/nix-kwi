@@ -26,27 +26,7 @@ stdenv.mkDerivation {
     kdePackages.wrapQtAppsHook
   ];
 
-  buildInputs = [
-    kdePackages.kirigami
-    kdePackages.kirigami-addons
-    kdePackages.kirigami-app-components
-    kdePackages.qqc2-desktop-style
-    kdePackages.kcoreaddons
-    kdePackages.kconfig
-    kdePackages.kdbusaddons
-    kdePackages.kguiaddons
-    kdePackages.ki18n
-    kdePackages.kio
-    kdePackages.kitemmodels
-    kdePackages.knotifications
-    kdePackages.kparts
-    kdePackages.kpty
-    kdePackages.kwindowsystem
-    kdePackages.kwidgetsaddons
-    kdePackages.kxmlgui
-    qt6.qtdeclarative
-    qt6.qtshadertools
-    qt6.qtsvg
+  buildInputs = (import ./runtime-dependencies.nix { inherit kdePackages qt6; }) ++ [
     libghostty-vt
   ];
 
