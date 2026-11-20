@@ -3,11 +3,11 @@
     "kwi-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1794968476,
-        "narHash": "sha256-6A/wsXluL3R/gDMGAaUviySCBdhkaC22A9m6YyiKhF0=",
+        "lastModified": 1795169956,
+        "narHash": "sha256-j0pIOpWaD1vSDDPAxVfC/NZgZjOBqHof5XEumVmXbSc=",
         "ref": "refs/heads/master",
-        "rev": "d9d3bdafbf8cd6fad333992502e56679efa05252",
-        "revCount": 145,
+        "rev": "c2ba9664f65c5f1f2fdeb9cdf3a899c0d7f0c16f",
+        "revCount": 165,
         "type": "git",
         "url": "https://invent.kde.org/utilities/kwi.git"
       },
