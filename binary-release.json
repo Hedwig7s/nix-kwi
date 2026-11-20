@@ -1,10 +1,10 @@
 {
   "formatVersion": 3,
-  "tag": null,
-  "version": null,
-  "upstreamRev": null,
+  "tag": "kwi-d9d3bdafbf8c-klchan6v15",
+  "version": "0.1.0-unstable",
+  "upstreamRev": "d9d3bdafbf8cd6fad333992502e56679efa05252",
   "archiveName": "kwi-x86_64-linux.tar.gz",
-  "sha256": null,
-  "kwiStorePath": null,
-  "libghosttyStorePath": null
+  "sha256": "sha256-BOO7BGMXQhrFpRpjlkJM+LqV+EX7eacRmYAE9IwKWM0=",
+  "kwiStorePath": "/nix/store/klchan6v15y23jd7bgkzab1qnhmy744h-kwi-0.1.0-unstable",
+  "libghosttyStorePath": "/nix/store/mzhm4qbz5zgy8l623cf99kn3vw7dgh8k-libghostty-vt-1.0.1"
 }
