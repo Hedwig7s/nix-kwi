@@ -1,10 +1,10 @@
 {
   "formatVersion": 3,
-  "tag": "kwi-e94666f0c955-7198wfqdxc",
+  "tag": "kwi-d7912d8a165f-2lamnvnh3k",
   "version": "0.1.80-unstable",
-  "upstreamRev": "e94666f0c955f85b9bae0f9bc3277bdd0681d5c5",
+  "upstreamRev": "d7912d8a165fb7da56ef0790d63d07085e4cf204",
   "archiveName": "kwi-x86_64-linux.tar.gz",
-  "sha256": "sha256-H7kluPbsYZVlaqYtbTb2XVIcypFWWHN4vMc/pNBh2gg=",
-  "kwiStorePath": "/nix/store/7198wfqdxc7rpb3apz9895lprbrbjn4h-kwi-0.1.80-unstable",
+  "sha256": "sha256-aMZPrx+lIBEXloXWtmBYVWdSZAXcxtxTm0qbcNZT8Dk=",
+  "kwiStorePath": "/nix/store/2lamnvnh3kdk70v30spgni2xv2wr1g95-kwi-0.1.80-unstable",
   "libghosttyStorePath": "/nix/store/mzhm4qbz5zgy8l623cf99kn3vw7dgh8k-libghostty-vt-1.0.1"
 }
